@@ -68,6 +68,68 @@ public class Address {
 
 package com.example.domain.validation;
 
+/**
+ * Thread-local context for validation
+ * Stores validation context and current property path
+ */
+public class ValidationThreadLocal {
+    private static final ThreadLocal<Map<String, Object>> CONTEXT = new ThreadLocal<>();
+    
+    /**
+     * Initialize the thread-local storage
+     */
+    public static void initialize() {
+        CONTEXT.set(new HashMap<>());
+    }
+    
+    /**
+     * Set the validation context
+     */
+    public static void setValidationContext(ValidationContext context) {
+        Map<String, Object> map = CONTEXT.get();
+        if (map == null) {
+            map = new HashMap<>();
+            CONTEXT.set(map);
+        }
+        map.put("context", context);
+    }
+    
+    /**
+     * Get the validation context
+     */
+    public static ValidationContext getValidationContext() {
+        Map<String, Object> map = CONTEXT.get();
+        return map != null ? (ValidationContext) map.get("context") : null;
+    }
+    
+    /**
+     * Set the current property path being validated
+     */
+    public static void setCurrentPath(String path) {
+        Map<String, Object> map = CONTEXT.get();
+        if (map != null) {
+            map.put("currentPath", path);
+        }
+    }
+    
+    /**
+     * Get the current property path being validated
+     */
+    public static String getCurrentPath() {
+        Map<String, Object> map = CONTEXT.get();
+        return map != null ? (String) map.get("currentPath") : null;
+    }
+    
+    /**
+     * Clear the thread-local storage
+     */
+    public static void clear() {
+        CONTEXT.remove();
+    }
+}
+
+package com.example.domain.validation;
+
 import java.lang.annotation.*;
 
 /**
@@ -89,47 +151,27 @@ public @interface SchemaValidation {
 @Component
 public class SchemaValidator implements ConstraintValidator<SchemaValidation, Object> {
     
-    // ThreadLocal to store validation context
-    private static final ThreadLocal<ValidationContext> VALIDATION_CONTEXT = new ThreadLocal<>();
+    @Override
+    public void initialize(SchemaValidation constraintAnnotation) {
+        // No initialization needed
+    }
     
     @Override
     public boolean isValid(Object value, ConstraintValidatorContext context) {
-        ValidationContext validationContext = VALIDATION_CONTEXT.get();
+        // Get the validation context from thread local
+        ValidationContext validationContext = ValidationThreadLocal.getValidationContext();
         if (validationContext == null) {
             return true; // No validation context available
         }
         
-        // Get field name from property path
-        String fieldName = extractFieldName(context);
+        // Get the current property path being validated
+        String fieldName = ValidationThreadLocal.getCurrentPath();
         if (fieldName == null) {
             return true; // Cannot determine field name
         }
         
         // Delegate validation to the ValidationContext
         return validationContext.validateField(fieldName, value, context);
-    }
-    
-    private String extractFieldName(ConstraintValidatorContext context) {
-        try {
-            return context.getPropertyPath().toString();
-        } catch (Exception e) {
-            // Log error
-            return null;
-        }
-    }
-    
-    /**
-     * Set the validation context for the current thread
-     */
-    public static void setValidationContext(ValidationContext context) {
-        VALIDATION_CONTEXT.set(context);
-    }
-    
-    /**
-     * Clear the validation context when done
-     */
-    public static void clearValidationContext() {
-        VALIDATION_CONTEXT.remove();
     }
 }
 
@@ -292,17 +334,20 @@ public final class ValidationUtils {
             T object, Map<String, ValidationRule> rules, Validator validator) {
         
         try {
+            // Initialize thread local
+            ValidationThreadLocal.initialize();
+            
             // Create validation context
             ValidationContext context = new ValidationContextImpl(object, rules);
             
-            // Set context in validator
-            SchemaValidator.setValidationContext(context);
+            // Set context in thread local
+            ValidationThreadLocal.setValidationContext(context);
             
             // Perform validation
             return validator.validate(object);
         } finally {
             // Clear context
-            SchemaValidator.clearValidationContext();
+            ValidationThreadLocal.clear();
         }
     }
     
@@ -313,22 +358,26 @@ public final class ValidationUtils {
             T object, Map<String, ValidationRule> rules, Validator validator, String... fieldNames) {
         
         try {
+            // Initialize thread local
+            ValidationThreadLocal.initialize();
+            
             // Create validation context
             ValidationContext context = new ValidationContextImpl(object, rules);
             
-            // Set context in validator
-            SchemaValidator.setValidationContext(context);
+            // Set context in thread local
+            ValidationThreadLocal.setValidationContext(context);
             
             // Validate specific fields
             Set<ConstraintViolation<T>> violations = new HashSet<>();
             for (String fieldName : fieldNames) {
+                ValidationThreadLocal.setCurrentPath(fieldName);
                 violations.addAll(validator.validateProperty(object, fieldName));
             }
             
             return violations;
         } finally {
             // Clear context
-            SchemaValidator.clearValidationContext();
+            ValidationThreadLocal.clear();
         }
     }
     
@@ -479,81 +528,7 @@ public class SchemaRegistry {
         schemaCache.clear();
         init();
     }
-}
-
-package com.example.app.controller;
-
-/**
- * Example controller using validation
- */
-@RestController
-@RequestMapping("/api/users")
-public class UserController {
-    
-    @Autowired
-    private Validator validator;
-    
-    @PostMapping("/{schemaName}")
-    public ResponseEntity<String> createUser(
-            @PathVariable String schemaName,
-            @RequestBody UserRequest userRequest) {
-        
-        // Get validation rules for schema
-        Map<String, ValidationRule> rules = SchemaRegistry.getSchemaRules(schemaName);
-        if (rules == null) {
-            return ResponseEntity.badRequest().body("Invalid schema: " + schemaName);
-        }
-        
-        try {
-            // Validate user request
-            ValidationUtils.validateAndThrow(userRequest, rules, validator);
-            
-            // Process the validated request
-            return ResponseEntity.ok("User created successfully");
-        } catch (ConstraintViolationException ex) {
-            // Handle validation errors
-            Map<String, String> errors = new HashMap<>();
-            ex.getConstraintViolations().forEach(violation -> {
-                String path = violation.getPropertyPath().toString();
-                String message = violation.getMessage();
-                errors.put(path, message);
-            });
-            
-            return ResponseEntity.badRequest().body("Validation failed: " + errors);
-        }
-    }
-    
-    // Example of validating specific fields
-    @PatchMapping("/{schemaName}/{id}")
-    public ResponseEntity<String> updateUser(
-            @PathVariable String schemaName,
-            @PathVariable String id,
-            @RequestBody Map<String, Object> updates) {
-        
-        // Get validation rules for schema
-        Map<String, ValidationRule> rules = SchemaRegistry.getSchemaRules(schemaName);
-        if (rules == null) {
-            return ResponseEntity.badRequest().body("Invalid schema: " + schemaName);
-        }
-        
-        // Get existing user
-        UserRequest existingUser = getUserById(id);
-        if (existingUser == null) {
-            return ResponseEntity.notFound().build();
-        }
-        
-        // Apply updates
-        applyUpdates(existingUser, updates);
-        
-        // Validate only updated fields
-        try {
-            Set<ConstraintViolation<UserRequest>> violations = 
-                ValidationUtils.validateFields(existingUser, rules, validator, 
-                    updates.keySet().toArray(new String[0]));
-            
-            if (!violations.isEmpty()) {
-                // Handle validation errors
-                return ResponseEntity.badRequest().body("Validation failed");
+}return ResponseEntity.badRequest().body("Validation failed");
             }
             
             // Process the validated request
@@ -617,6 +592,76 @@ public class UserService {
             ValidationUtils.validateFields(request, rules, validator, fieldNames);
         
         return violations.isEmpty();
+    }
+    
+    /**
+     * Custom manual validation without using annotations
+     */
+    public boolean validateManually(Map<String, Object> data, String schemaName) {
+        // Get schema rules
+        Map<String, ValidationRule> rules = SchemaRegistry.getSchemaRules(schemaName);
+        if (rules == null) {
+            return false;
+        }
+        
+        // For each field that needs validation
+        for (Map.Entry<String, ValidationRule> entry : rules.entrySet()) {
+            String fieldPath = entry.getKey();
+            ValidationRule rule = entry.getValue();
+            
+            // Get value from nested path if needed (e.g. "address.city")
+            Object value = getValueFromPath(data, fieldPath);
+            
+            // Is field required?
+            boolean isRequired = false;
+            
+            if (rule.isRequired()) {
+                isRequired = true;
+            } else if (rule.isConditional() && rule.getCondition() != null) {
+                isRequired = ValidationUtils.evaluateCondition(rule.getCondition(), data);
+            }
+            
+            if (isRequired && ValidationUtils.isEmpty(value)) {
+                return false; // Validation failed - required field is missing
+            }
+            
+            // Validate type if value is not null
+            if (value != null && rule.getFieldType() != null) {
+                boolean typeValid = ValidationUtils.validateType(
+                    value, rule.getFieldType(), rule.getTypeValidationParams());
+                
+                if (!typeValid) {
+                    return false; // Validation failed - type mismatch
+                }
+            }
+        }
+        
+        return true; // All validations passed
+    }
+    
+    /**
+     * Helper method to get a value from a nested path in a map
+     */
+    private Object getValueFromPath(Map<String, Object> data, String path) {
+        if (path == null || path.isEmpty()) {
+            return null;
+        }
+        
+        String[] parts = path.split("\\.");
+        Object current = data;
+        
+        for (String part : parts) {
+            if (current instanceof Map) {
+                current = ((Map<?, ?>) current).get(part);
+                if (current == null) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+        
+        return current;
     }
 }
 
@@ -691,3 +736,156 @@ public class UserService {
   }
 }
 */
+
+//==============================================================================
+// CUSTOM PATH-TRACKING VALIDATOR (OPTIONAL ENHANCEMENT)
+//==============================================================================
+
+/**
+ * Optional custom validator factory that tracks property paths automatically
+ * This would replace standard validator injection in the app
+ */
+@Component
+public class PathTrackingValidatorFactory implements ValidatorFactory {
+    
+    private final ValidatorFactory defaultFactory = Validation.buildDefaultValidatorFactory();
+    
+    @Override
+    public Validator getValidator() {
+        return new PathTrackingValidator(defaultFactory.getValidator());
+    }
+    
+    @Override
+    public MessageInterpolator getMessageInterpolator() {
+        return defaultFactory.getMessageInterpolator();
+    }
+    
+    @Override
+    public TraversableResolver getTraversableResolver() {
+        return defaultFactory.getTraversableResolver();
+    }
+    
+    @Override
+    public ConstraintValidatorFactory getConstraintValidatorFactory() {
+        return defaultFactory.getConstraintValidatorFactory();
+    }
+    
+    @Override
+    public ParameterNameProvider getParameterNameProvider() {
+        return defaultFactory.getParameterNameProvider();
+    }
+    
+    @Override
+    public ClockProvider getClockProvider() {
+        return defaultFactory.getClockProvider();
+    }
+    
+    @Override
+    public void close() {
+        defaultFactory.close();
+    }
+    
+    @Override
+    public <T> T unwrap(Class<T> type) {
+        return defaultFactory.unwrap(type);
+    }
+    
+    /**
+     * Custom validator that tracks property paths during validation
+     */
+    private static class PathTrackingValidator implements Validator {
+        private final Validator delegate;
+        
+        public PathTrackingValidator(Validator delegate) {
+            this.delegate = delegate;
+        }
+        
+        @Override
+        public <T> Set<ConstraintViolation<T>> validate(T object, Class<?>... groups) {
+            // For full object validation, individual paths will be handled
+            // by validateProperty for each property with constraints
+            return delegate.validate(object, groups);
+        }
+        
+        @Override
+        public <T> Set<ConstraintViolation<T>> validateProperty(T object, String propertyName, Class<?>... groups) {
+            try {
+                // Set the current property path in the thread-local context
+                ValidationThreadLocal.setCurrentPath(propertyName);
+                
+                // Delegate to the standard validator
+                return delegate.validateProperty(object, propertyName, groups);
+            } finally {
+                // Always clear the path even if an exception occurs
+                ValidationThreadLocal.setCurrentPath(null);
+            }
+        }
+        
+        @Override
+        public <T> Set<ConstraintViolation<T>> validateValue(Class<T> beanType, String propertyName, Object value, Class<?>... groups) {
+            try {
+                // Set the current property path in the thread-local context
+                ValidationThreadLocal.setCurrentPath(propertyName);
+                
+                // Delegate to the standard validator
+                return delegate.validateValue(beanType, propertyName, value, groups);
+            } finally {
+                // Always clear the path even if an exception occurs
+                ValidationThreadLocal.setCurrentPath(null);
+            }
+        }
+    }
+}
+
+/**
+ * Spring configuration to use the custom validator factory
+ */
+@Configuration
+public class ValidationConfig {
+    
+    @Bean
+    public LocalValidatorFactoryBean validator() {
+        return new LocalValidatorFactoryBean() {
+            @Override
+            public Validator getValidator() {
+                return new PathTrackingValidator(super.getValidator());
+            }
+        };
+    }
+    
+    /**
+     * Custom validator that tracks property paths during validation
+     */
+    private static class PathTrackingValidator implements Validator {
+        private final Validator delegate;
+        
+        public PathTrackingValidator(Validator delegate) {
+            this.delegate = delegate;
+        }
+        
+        @Override
+        public <T> Set<ConstraintViolation<T>> validate(T object, Class<?>... groups) {
+            return delegate.validate(object, groups);
+        }
+        
+        @Override
+        public <T> Set<ConstraintViolation<T>> validateProperty(T object, String propertyName, Class<?>... groups) {
+            try {
+                ValidationThreadLocal.setCurrentPath(propertyName);
+                return delegate.validateProperty(object, propertyName, groups);
+            } finally {
+                ValidationThreadLocal.setCurrentPath(null);
+            }
+        }
+        
+        @Override
+        public <T> Set<ConstraintViolation<T>> validateValue(Class<T> beanType, String propertyName, Object value, Class<?>... groups) {
+            try {
+                ValidationThreadLocal.setCurrentPath(propertyName);
+                return delegate.validateValue(beanType, propertyName, value, groups);
+            } finally {
+                ValidationThreadLocal.setCurrentPath(null);
+            }
+        }
+    }
+}
